@@ -1,0 +1,6 @@
+google-api-python-client
+requests
+python-dotenv
+flask_limiter
+flask
+pytubefix
