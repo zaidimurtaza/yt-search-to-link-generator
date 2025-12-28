@@ -1,18 +1,11 @@
 from dotenv import load_dotenv
 import os
 from googleapiclient.discovery import build
-from pytubefix import YouTube
+from yt_dlp import YoutubeDL
 import datetime
 import time
 from pathlib import Path
 import requests
-# Import exceptions if available
-try:
-    from pytubefix.exceptions import PytubefixException, VideoUnavailable
-except ImportError:
-    # Fallback if exceptions module doesn't exist
-    PytubefixException = Exception
-    VideoUnavailable = Exception
 load_dotenv()
 API_KEY = os.getenv("key")
 YOUTUBE = build("youtube", "v3", developerKey=API_KEY)
@@ -79,58 +72,108 @@ def get_top_songs(song_name, max_results=2):
 
 def download_song(song_url, title="abc", base_url="", max_retries=3):
     filename = unique_file_name(title)
+    # yt-dlp will determine the extension, so we use a template
+    audio_path_template = str(AUDIO_DIR / f"{filename}.%(ext)s")
     
-    # Retry logic for YouTube initialization and download
+    # Try different extractor options to bypass restrictions
+    extractor_options = [
+        # Method 1: Android client (often bypasses restrictions)
+        {
+            'extractor_args': {'youtube': {'player_client': ['android']}},
+        },
+        # Method 2: iOS client
+        {
+            'extractor_args': {'youtube': {'player_client': ['ios']}},
+        },
+        # Method 3: TV client
+        {
+            'extractor_args': {'youtube': {'player_client': ['tv_embedded']}},
+        },
+        # Method 4: Default web client
+        {},
+    ]
+    
+    # Retry logic with different clients
     for attempt in range(max_retries):
-        try:
-            # Try with use_po_token first, then without if it fails
-            use_token = attempt < 2  # Use token for first 2 attempts
-            yt = YouTube(song_url, use_po_token=use_token)
-            
-            # Get thumbnail
-            thumbnail_path = download_thumbnail(yt.thumbnail_url, filename+".jpg")
-            
-            # Filter only audio
-            audio_stream = yt.streams.filter(only_audio=True).first()
-            
-            if audio_stream is None:
-                raise Exception("No audio stream found")
-            
-            # Download audio
-            output_file = audio_stream.download(
-                filename=filename+".mp4",
-                output_path=str(AUDIO_DIR)
-            )
-            
-            # Convert Path objects to strings and generate URLs
-            audio_filename = Path(output_file).name
-            thumbnail_filename = Path(thumbnail_path).name
-            
-            audio_url = f"{base_url}/audio/{audio_filename}" if base_url else f"/audio/{audio_filename}"
-            thumbnail_url = f"{base_url}/thumbnails/{thumbnail_filename}" if base_url else f"/thumbnails/{thumbnail_filename}"
-            
-            return {
-                "filename": filename,
-                "audio_url": audio_url,
-                "thumbnail_url": thumbnail_url,
-            }
-            
-        except (PytubefixException, Exception) as e:
-            error_msg = str(e)
-            if attempt < max_retries - 1:
-                # Wait before retrying (exponential backoff)
-                wait_time = (2 ** attempt) * 2  # 2, 4, 8 seconds
-                time.sleep(wait_time)
-                continue
-            else:
-                # Last attempt failed, raise the exception
-                raise Exception(f"Failed after {max_retries} attempts: {error_msg}")
+        for method_idx, extractor_opts in enumerate(extractor_options):
+            try:
+                # Get video info first to extract thumbnail
+                info_opts = {
+                    'quiet': True,
+                    'no_warnings': True,
+                    **extractor_opts
+                }
+                
+                with YoutubeDL(info_opts) as ydl:
+                    video_info = ydl.extract_info(song_url, download=False)
+                    thumbnail_url = video_info.get('thumbnail', '')
+                
+                # Download thumbnail
+                if thumbnail_url:
+                    thumbnail_path = download_thumbnail(thumbnail_url, filename+".jpg")
+                else:
+                    raise Exception("Could not get thumbnail URL")
+                
+                # Download audio with specific format
+                download_opts = {
+                    'format': 'bestaudio/best',
+                    'outtmpl': audio_path_template,
+                    'quiet': True,
+                    'no_warnings': True,
+                    'noplaylist': True,
+                    **extractor_opts
+                }
+                
+                with YoutubeDL(download_opts) as ydl:
+                    ydl.download([song_url])
+                
+                # Find the downloaded file (yt-dlp may use different extensions)
+                downloaded_files = list(AUDIO_DIR.glob(f"{filename}.*"))
+                if not downloaded_files:
+                    raise Exception("Downloaded file not found")
+                
+                # Get the actual downloaded file
+                audio_path = downloaded_files[0]
+                audio_filename = audio_path.name
+                thumbnail_filename = Path(thumbnail_path).name
+                
+                audio_url = f"{base_url}/audio/{audio_filename}" if base_url else f"/audio/{audio_filename}"
+                thumbnail_url_final = f"{base_url}/thumbnails/{thumbnail_filename}" if base_url else f"/thumbnails/{thumbnail_filename}"
+                
+                return {
+                    "filename": filename,
+                    "audio_url": audio_url,
+                    "thumbnail_url": thumbnail_url_final,
+                }
+                
+            except Exception as e:
+                error_msg = str(e)
+                # If this is the last method and last attempt, raise error
+                if method_idx == len(extractor_options) - 1 and attempt == max_retries - 1:
+                    raise Exception(f"Failed after {max_retries} attempts with all methods: {error_msg}")
+                # Otherwise, try next method or retry
+                if method_idx < len(extractor_options) - 1:
+                    continue  # Try next method
+                else:
+                    # All methods failed, wait and retry
+                    wait_time = (2 ** attempt) * 2  # 2, 4, 8 seconds
+                    time.sleep(wait_time)
+                    break  # Break inner loop to retry with first method
 
 def delete_song(filename):
-    audio_path = AUDIO_DIR / f"{filename}.mp4"
+    # Find audio file (may have different extensions)
+    audio_files = list(AUDIO_DIR.glob(f"{filename}.*"))
     thumbnail_path = THUMBNAIL_DIR / f"{filename}.jpg"
-    audio_path.unlink()
-    thumbnail_path.unlink()
+    
+    # Delete audio file(s) if found
+    for audio_file in audio_files:
+        if audio_file.exists():
+            audio_file.unlink()
+    
+    # Delete thumbnail if exists
+    if thumbnail_path.exists():
+        thumbnail_path.unlink()
+    
     return {"message": "Song deleted", "status": "success"}
 
 if __name__ == "__main__":
