@@ -6,6 +6,13 @@ import datetime
 import time
 from pathlib import Path
 import requests
+# Import exceptions if available
+try:
+    from pytubefix.exceptions import PytubefixException, VideoUnavailable
+except ImportError:
+    # Fallback if exceptions module doesn't exist
+    PytubefixException = Exception
+    VideoUnavailable = Exception
 load_dotenv()
 API_KEY = os.getenv("key")
 YOUTUBE = build("youtube", "v3", developerKey=API_KEY)
@@ -70,29 +77,54 @@ def get_top_songs(song_name, max_results=2):
         results.append(video)
     return results
 
-def download_song(song_url, title="abc", base_url=""):
-    yt = YouTube(song_url, use_po_token=True)
+def download_song(song_url, title="abc", base_url="", max_retries=3):
     filename = unique_file_name(title)
-
-    thumbnail_path = download_thumbnail(yt.thumbnail_url, filename+".jpg")
-    # filter only audio
-    audio_stream = yt.streams.filter(only_audio=True).first()
-
-    output_file = audio_stream.download(filename=filename+".mp4",
-    output_path=str(AUDIO_DIR))
     
-    # Convert Path objects to strings and generate URLs
-    audio_filename = Path(output_file).name
-    thumbnail_filename = Path(thumbnail_path).name
-    
-    audio_url = f"{base_url}/audio/{audio_filename}" if base_url else f"/audio/{audio_filename}"
-    thumbnail_url = f"{base_url}/thumbnails/{thumbnail_filename}" if base_url else f"/thumbnails/{thumbnail_filename}"
-    
-    return {
-        "filename": filename,
-        "audio_url": audio_url,
-        "thumbnail_url": thumbnail_url,
-    }
+    # Retry logic for YouTube initialization and download
+    for attempt in range(max_retries):
+        try:
+            # Try with use_po_token first, then without if it fails
+            use_token = attempt < 2  # Use token for first 2 attempts
+            yt = YouTube(song_url, use_po_token=use_token)
+            
+            # Get thumbnail
+            thumbnail_path = download_thumbnail(yt.thumbnail_url, filename+".jpg")
+            
+            # Filter only audio
+            audio_stream = yt.streams.filter(only_audio=True).first()
+            
+            if audio_stream is None:
+                raise Exception("No audio stream found")
+            
+            # Download audio
+            output_file = audio_stream.download(
+                filename=filename+".mp4",
+                output_path=str(AUDIO_DIR)
+            )
+            
+            # Convert Path objects to strings and generate URLs
+            audio_filename = Path(output_file).name
+            thumbnail_filename = Path(thumbnail_path).name
+            
+            audio_url = f"{base_url}/audio/{audio_filename}" if base_url else f"/audio/{audio_filename}"
+            thumbnail_url = f"{base_url}/thumbnails/{thumbnail_filename}" if base_url else f"/thumbnails/{thumbnail_filename}"
+            
+            return {
+                "filename": filename,
+                "audio_url": audio_url,
+                "thumbnail_url": thumbnail_url,
+            }
+            
+        except (PytubefixException, Exception) as e:
+            error_msg = str(e)
+            if attempt < max_retries - 1:
+                # Wait before retrying (exponential backoff)
+                wait_time = (2 ** attempt) * 2  # 2, 4, 8 seconds
+                time.sleep(wait_time)
+                continue
+            else:
+                # Last attempt failed, raise the exception
+                raise Exception(f"Failed after {max_retries} attempts: {error_msg}")
 
 def delete_song(filename):
     audio_path = AUDIO_DIR / f"{filename}.mp4"
