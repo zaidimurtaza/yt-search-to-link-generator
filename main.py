@@ -6,6 +6,8 @@ import datetime
 import time
 from pathlib import Path
 import requests
+import base64
+import tempfile
 load_dotenv()
 API_KEY = os.getenv("key")
 YOUTUBE = build("youtube", "v3", developerKey=API_KEY)
@@ -72,70 +74,158 @@ def get_top_songs(song_name, max_results=2):
 
 def download_song(song_url, title="abc", base_url="", max_retries=3):
     filename = unique_file_name(title)
-    # yt-dlp will determine the extension, so we use a template
     audio_path_template = str(AUDIO_DIR / f"{filename}.%(ext)s")
     
-    # Try different extractor options to bypass restrictions
-    extractor_options = [
-        # Method 1: Android client (often bypasses restrictions)
-        {
-            'extractor_args': {'youtube': {'player_client': ['android']}},
+    # Check for cookies - try multiple methods
+    cookies_path = None
+    
+    # Method 1: Check environment variable for file path
+    cookies_file = os.getenv('YOUTUBE_COOKIES_FILE', 'cookies.txt')
+    if Path(cookies_file).exists():
+        cookies_path = Path(cookies_file)
+    elif Path('cookies.txt').exists():
+        cookies_path = Path('cookies.txt')
+    
+    # Method 2: Check for base64 encoded cookies in environment
+    cookies_b64 = os.getenv('YOUTUBE_COOKIES_B64')
+    if not cookies_path and cookies_b64:
+        try:
+            cookies_content = base64.b64decode(cookies_b64).decode('utf-8')
+            # Create temporary cookies file
+            temp_cookies = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+            temp_cookies.write(cookies_content)
+            temp_cookies.close()
+            cookies_path = Path(temp_cookies.name)
+        except Exception:
+            pass
+    
+    # Most aggressive bypass options
+    base_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'format': 'bestaudio/best',
+        'outtmpl': audio_path_template,
+        'socket_timeout': 60,
+        'extractor_retries': 5,
+        'fragment_retries': 5,
+        'retries': 5,
+        'file_access_retries': 3,
+        'http_chunk_size': 10485760,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'referer': 'https://www.youtube.com/',
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android'],
+                'player_skip': ['webpage', 'configs'],
+                'skip': ['dash', 'hls'],
+            }
         },
-        # Method 2: iOS client
+        'http_headers': {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-us,en;q=0.5',
+            'Sec-Fetch-Mode': 'navigate',
+        }
+    }
+    
+    if cookies_path:
+        base_opts['cookiefile'] = str(cookies_path)
+    
+    # Try different client strategies in order of effectiveness
+    client_strategies = [
         {
-            'extractor_args': {'youtube': {'player_client': ['ios']}},
+            'player_client': ['android'],
+            'player_skip': ['webpage', 'configs'],
+            'skip': ['dash', 'hls'],
         },
-        # Method 3: TV client
         {
-            'extractor_args': {'youtube': {'player_client': ['tv_embedded']}},
+            'player_client': ['android_embedded'],
+            'player_skip': ['webpage', 'configs'],
         },
-        # Method 4: Default web client
-        {},
+        {
+            'player_client': ['ios'],
+            'player_skip': ['webpage', 'configs'],
+        },
+        {
+            'player_client': ['tv_embedded'],
+            'player_skip': ['webpage'],
+        },
+        {
+            'player_client': ['web'],
+            'player_skip': [],
+        },
     ]
     
-    # Retry logic with different clients
+    last_error = None
     for attempt in range(max_retries):
-        for method_idx, extractor_opts in enumerate(extractor_options):
+        for strategy_idx, strategy in enumerate(client_strategies):
             try:
-                # Get video info first to extract thumbnail
-                info_opts = {
-                    'quiet': True,
-                    'no_warnings': True,
-                    **extractor_opts
-                }
+                opts = base_opts.copy()
+                opts['extractor_args'] = {'youtube': strategy}
                 
-                with YoutubeDL(info_opts) as ydl:
-                    video_info = ydl.extract_info(song_url, download=False)
-                    thumbnail_url = video_info.get('thumbnail', '')
+                # Extract video ID for thumbnail fallback
+                video_id = None
+                try:
+                    video_id = song_url.split('v=')[-1].split('&')[0].split('?')[0]
+                except:
+                    pass
                 
-                # Download thumbnail
+                # First, get video info to extract thumbnail
+                info_opts = opts.copy()
+                info_opts['skip_download'] = True
+                
+                video_info = None
+                thumbnail_url = None
+                
+                try:
+                    with YoutubeDL(info_opts) as ydl:
+                        video_info = ydl.extract_info(song_url, download=False)
+                        thumbnail_url = (video_info.get('thumbnail') or 
+                                       (video_info.get('thumbnails', [{}])[0].get('url') if video_info.get('thumbnails') else None))
+                        
+                        if not thumbnail_url and video_id:
+                            thumbnail_url = f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
+                except Exception as info_error:
+                    # Fallback: Use YouTube Data API to get thumbnail
+                    if video_id and API_KEY:
+                        try:
+                            api_response = YOUTUBE.videos().list(
+                                part='snippet',
+                                id=video_id
+                            ).execute()
+                            if api_response.get('items'):
+                                thumbnail_url = api_response['items'][0]['snippet']['thumbnails']['high']['url']
+                        except:
+                            pass
+                    
+                    # Final fallback: construct thumbnail URL from video ID
+                    if not thumbnail_url and video_id:
+                        thumbnail_url = f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
+                
+                # Download thumbnail if we have a URL
+                thumbnail_path = None
                 if thumbnail_url:
-                    thumbnail_path = download_thumbnail(thumbnail_url, filename+".jpg")
-                else:
-                    raise Exception("Could not get thumbnail URL")
+                    try:
+                        thumbnail_path = download_thumbnail(thumbnail_url, filename+".jpg")
+                    except:
+                        # Thumbnail download failed, continue anyway
+                        pass
                 
-                # Download audio with specific format
-                download_opts = {
-                    'format': 'bestaudio/best',
-                    'outtmpl': audio_path_template,
-                    'quiet': True,
-                    'no_warnings': True,
-                    'noplaylist': True,
-                    **extractor_opts
-                }
+                # Now download the audio
+                download_opts = opts.copy()
+                download_opts.pop('skip_download', None)
                 
                 with YoutubeDL(download_opts) as ydl:
                     ydl.download([song_url])
                 
-                # Find the downloaded file (yt-dlp may use different extensions)
+                # Find the downloaded file
                 downloaded_files = list(AUDIO_DIR.glob(f"{filename}.*"))
                 if not downloaded_files:
-                    raise Exception("Downloaded file not found")
+                    raise Exception("Downloaded file not found after download")
                 
-                # Get the actual downloaded file
                 audio_path = downloaded_files[0]
                 audio_filename = audio_path.name
-                thumbnail_filename = Path(thumbnail_path).name
+                thumbnail_filename = Path(thumbnail_path).name if thumbnail_path else f"{filename}.jpg"
                 
                 audio_url = f"{base_url}/audio/{audio_filename}" if base_url else f"/audio/{audio_filename}"
                 thumbnail_url_final = f"{base_url}/thumbnails/{thumbnail_filename}" if base_url else f"/thumbnails/{thumbnail_filename}"
@@ -147,18 +237,26 @@ def download_song(song_url, title="abc", base_url="", max_retries=3):
                 }
                 
             except Exception as e:
-                error_msg = str(e)
-                # If this is the last method and last attempt, raise error
-                if method_idx == len(extractor_options) - 1 and attempt == max_retries - 1:
-                    raise Exception(f"Failed after {max_retries} attempts with all methods: {error_msg}")
-                # Otherwise, try next method or retry
-                if method_idx < len(extractor_options) - 1:
-                    continue  # Try next method
+                last_error = str(e)
+                error_lower = last_error.lower()
+                
+                # Check for bot detection
+                is_bot_error = any(keyword in error_lower for keyword in ['bot', 'sign in', 'cookies', 'confirm you'])
+                
+                # If it's the last attempt with last strategy, raise
+                if strategy_idx == len(client_strategies) - 1 and attempt == max_retries - 1:
+                    if is_bot_error:
+                        raise Exception(f"YouTube bot detection: {last_error[:300]}. Solution: Add cookies.txt file or set YOUTUBE_COOKIES_FILE environment variable.")
+                    raise Exception(f"Download failed: {last_error[:300]}")
+                
+                # Wait before next attempt
+                if strategy_idx < len(client_strategies) - 1:
+                    time.sleep(0.5)
                 else:
-                    # All methods failed, wait and retry
-                    wait_time = (2 ** attempt) * 2  # 2, 4, 8 seconds
-                    time.sleep(wait_time)
-                    break  # Break inner loop to retry with first method
+                    time.sleep(2 * (attempt + 1))
+                    break
+    
+    raise Exception(f"All attempts failed. Last error: {last_error[:300] if last_error else 'Unknown error'}")
 
 def delete_song(filename):
     # Find audio file (may have different extensions)
