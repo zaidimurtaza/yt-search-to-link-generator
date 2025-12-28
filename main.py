@@ -71,7 +71,7 @@ def get_top_songs(song_name, max_results=2):
     return results
 
 def download_song(song_url, title="abc", base_url=""):
-    yt = YouTube(song_url)
+    yt = YouTube(song_url, use_po_token=True)
     filename = unique_file_name(title)
 
     thumbnail_path = download_thumbnail(yt.thumbnail_url, filename+".jpg")
